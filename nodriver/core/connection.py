@@ -343,11 +343,17 @@ class Connection(metaclass=CantTouchThis):
         """
         closes the websocket connection. should not be called manually by users.
         """
-        if self._listener_task:
-            self._listener_task.cancel()
+        listener = self._listener_task
+        self._listener_task = None
+        if listener and listener is not asyncio.current_task() and not listener.done():
+            listener.cancel()
+            await asyncio.gather(listener, return_exceptions=True)
         if self.websocket:
             self.enabled_domains.clear()
-            await self.websocket.close()
+            try:
+                await self.websocket.close()
+            finally:
+                self._websocket = None
             logger.debug("\n❌ closed websocket connection to %s", self.websocket_url)
 
     def __getattr__(self, item):
@@ -364,6 +370,15 @@ class Connection(metaclass=CantTouchThis):
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """:meta private:"""
         await self.close()
+
+    async def close(self):
+        """
+        Alias for disconnect().
+
+        Note: Tab overrides close() to close the target; Connection.close() is for closing
+        the websocket transport.
+        """
+        await self.disconnect()
 
     async def _register_handlers(self):
         """
@@ -517,7 +532,8 @@ class Connection(metaclass=CantTouchThis):
         the_id = next(self.__count__)
         tx.id = the_id
         self.mapper[the_id] = tx
-        asyncio.create_task(self.websocket.send(tx.message))
+        # Apply backpressure: avoid spawning unbounded send tasks when issuing lots of commands.
+        await self.websocket.send(tx.message)
         return await tx
 
     async def _send_oneshot(self, cdp_obj):
