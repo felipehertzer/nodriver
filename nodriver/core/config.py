@@ -8,6 +8,7 @@ import logging
 import os
 import pathlib
 import secrets
+import shutil
 import sys
 import tempfile
 import zipfile
@@ -100,7 +101,11 @@ class Config:
         self.host = host
         self.port = port
         self.expert = expert
-        self._extensions = []
+        # Extension sources: user-provided paths (directory or packaged extension file).
+        # Prepared extensions: directories passed to Chrome via --load-extension (may include temp dirs).
+        self._extension_sources: List[pathlib.Path] = []
+        self._extensions: List[str] = []
+        self._temp_extension_dirs: set[str] = set()
         # when using posix-ish operating system and running as root
         # you must use no_sandbox = True, which in case is corrected here
         if is_posix and is_root() and sandbox:
@@ -160,16 +165,63 @@ class Config:
         if not path.exists():
             raise FileNotFoundError("could not find anything here: %s" % str(path))
 
-        if path.is_file():
-            tf = tempfile.mkdtemp(prefix=f"extension_", suffix=secrets.token_hex(4))
-            with zipfile.ZipFile(path, "r") as z:
-                z.extractall(tf)
-                self._extensions.append(tf)
-
-        elif path.is_dir():
+        if path.is_dir():
+            # Normalize to the directory containing the manifest.
             for item in path.rglob("manifest.*"):
                 path = item.parent
-            self._extensions.append(path)
+            self._extension_sources.append(path)
+        else:
+            # Packaged extension file (e.g. .crx). We'll extract it at browser start,
+            # so we can always clean up the temp directory afterwards without breaking
+            # re-use of this Config across multiple runs.
+            self._extension_sources.append(path)
+
+    def _prepare_extensions(self) -> List[str]:
+        """
+        Prepare the extension directories for a single browser run.
+
+        - Directory sources are used as-is.
+        - File sources are extracted into a unique temp directory (tracked for cleanup).
+        """
+        # Remove any stale temp extraction dirs from a previous run attempt.
+        self.cleanup_extensions()
+
+        prepared: List[str] = []
+        for src in self._extension_sources:
+            if src.is_file():
+                tf = tempfile.mkdtemp(
+                    prefix="extension_", suffix=secrets.token_hex(4)
+                )
+                try:
+                    with zipfile.ZipFile(src, "r") as z:
+                        z.extractall(tf)
+                except Exception:
+                    # Best-effort cleanup of the just-created directory.
+                    shutil.rmtree(tf, ignore_errors=True)
+                    raise
+                self._temp_extension_dirs.add(tf)
+                prepared.append(tf)
+            else:
+                prepared.append(str(src))
+
+        self._extensions = prepared
+        return prepared
+
+    def cleanup_extensions(self):
+        """Remove any temp directories created for extracted packaged extensions."""
+        temp_dirs = list(getattr(self, "_temp_extension_dirs", set()))
+        for d in temp_dirs:
+            try:
+                shutil.rmtree(d, ignore_errors=False)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.debug("failed to remove temp extension dir %s", d, exc_info=True)
+        if hasattr(self, "_temp_extension_dirs"):
+            self._temp_extension_dirs.clear()
+        # Drop prepared extension dirs so we don't keep referencing deleted paths.
+        if hasattr(self, "_extensions"):
+            self._extensions = []
 
     def __call__(self):
         # the host and port will be added when starting
@@ -184,6 +236,8 @@ class Config:
             disabled_features += ",DisableLoadExtensionCommandLineSwitch"
         args += [f"--disable-features={disabled_features}"]
         if self._extensions:
+            # Prepared by _prepare_extensions() (called by Browser.start()).
+            args += ["--load-extension=%s" % ",".join(str(_) for _ in self._extensions)]
             args += ["--enable-unsafe-extension-debugging"]
         if self.expert:
             args += ["--disable-site-isolation-trials"]
