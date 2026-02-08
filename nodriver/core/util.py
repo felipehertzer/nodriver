@@ -4642,6 +4642,9 @@ class ProxyForwarder:
     use_ssl: bool = None
     ssl_context: SSLContext = None
 
+    _loop: asyncio.AbstractEventLoop | None = None
+    _listen_task: asyncio.Task | None = None
+
     @property
     def proxy_server(self):
         return self._proxy_server
@@ -4686,13 +4689,60 @@ class ProxyForwarder:
                 )
                 logger.info("starting forward proxy on %s:%d" % (self.host, self.port))
                 logger.info("which forwards to %s" % proxy_server)
-                asyncio.ensure_future(self.listen())
+                # Start the local forwarder server on the current running loop and keep
+                # a handle so it can be shut down cleanly when the browser stops.
+                try:
+                    self._loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    self._loop = None
+                if self._loop:
+                    self._listen_task = self._loop.create_task(self.listen())
+                else:
+                    self._listen_task = asyncio.ensure_future(self.listen())
 
     async def listen(self):
         self.server = await asyncio.start_server(
             self.handle_request, host=self.host, port=self.port
         )
         await self.server.start_serving()
+
+    async def aclose(self, timeout: float = 2.0):
+        """
+        Close the local proxy forwarder.
+
+        This is best-effort and should not raise; it is primarily used to avoid leaking
+        server sockets/tasks in long-running processes.
+        """
+        task = getattr(self, "_listen_task", None)
+        self._listen_task = None
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        srv = getattr(self, "server", None)
+        self.server = None
+        if srv:
+            try:
+                srv.close()
+                await asyncio.wait_for(srv.wait_closed(), timeout=timeout)
+            except Exception:
+                pass
+
+    def close(self):
+        """Sync-friendly close helper (schedules aclose() when possible)."""
+        try:
+            loop = getattr(self, "_loop", None)
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(lambda: loop.create_task(self.aclose()))
+                return
+        except Exception:
+            pass
+        try:
+            srv = getattr(self, "server", None)
+            if srv:
+                srv.close()
+        except Exception:
+            pass
 
     async def handle_request(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

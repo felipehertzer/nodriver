@@ -124,6 +124,7 @@ class Browser:
         self._process = None
         self._process_pid = None
         self._keep_user_data_dir = None
+        self._proxy_forwarders = []
         self._is_updating = asyncio.Event()
         self.connection: Connection = None
         logger.debug("Session object initialized: %s" % vars(self))
@@ -335,6 +336,10 @@ class Browser:
                 proxy_server=proxy_server, ssl_context=proxy_ssl_context
             )
             proxy_server = fw.proxy_server
+            try:
+                self._proxy_forwarders.append(fw)
+            except Exception:
+                pass
 
         ctx: cdp.browser.BrowserContextID = await self.connection.send(
             cdp.target.create_browser_context(
@@ -691,6 +696,23 @@ class Browser:
         without relying on pending tasks that might never run (e.g. when the loop
         stops right after).
         """
+        # Close any local proxy forwarders (used for authenticated proxy URLs).
+        try:
+            fws = getattr(self, "_proxy_forwarders", None) or []
+            for fw in list(fws):
+                try:
+                    close = getattr(fw, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    pass
+            try:
+                fws.clear()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         # Best-effort websocket disconnect.
         # Do not attempt CDP Browser.close here: it can hang forever if Chrome is already wedged.
         if self.connection:
@@ -855,6 +877,29 @@ class Browser:
         It is resilient to cancellation and always falls back to killing the process + deleting temp dirs.
         """
         try:
+            # Close proxy forwarders while we still have a running loop.
+            try:
+                fws = list(getattr(self, "_proxy_forwarders", []) or [])
+                self._proxy_forwarders = []
+                for fw in fws:
+                    try:
+                        aclose = getattr(fw, "aclose", None)
+                        if callable(aclose):
+                            await asyncio.wait_for(aclose(), timeout=2.0)
+                        else:
+                            close = getattr(fw, "close", None)
+                            if callable(close):
+                                close()
+                    except BaseException:
+                        try:
+                            close = getattr(fw, "close", None)
+                            if callable(close):
+                                close()
+                        except Exception:
+                            pass
+            except BaseException:
+                pass
+
             if self.connection:
                 try:
                     await asyncio.wait_for(self.connection.disconnect(), timeout=timeout)
