@@ -25,7 +25,7 @@ from typing import List, Tuple, Union
 
 from .. import cdp
 from . import tab, util
-from ._temp import cleanup_chromium_singleton_dirs
+from ._temp import cleanup_chromium_singleton_dirs, cleanup_legacy_uc_profile_dirs
 from ._contradict import ContraDict
 from .config import Config, PathLike, is_posix
 from .connection import Connection
@@ -390,6 +390,12 @@ class Browser:
                 # These can leak on crashes/forced kills and accumulate on long-running workloads.
                 try:
                     cleanup_chromium_singleton_dirs()
+                except Exception:
+                    pass
+                # Remove stale legacy temp profiles created by older nodriver versions directly
+                # under the system temp dir ($TMPDIR/uc_*).
+                try:
+                    cleanup_legacy_uc_profile_dirs()
                 except Exception:
                     pass
 
@@ -881,6 +887,11 @@ class Browser:
         # These can leak on crashes/forced kills and are not under the profile directory.
         try:
             cleanup_chromium_singleton_dirs()
+        except Exception:
+            pass
+        # Clean up stale legacy temp profiles directly under the system temp dir.
+        try:
+            cleanup_legacy_uc_profile_dirs()
         except Exception:
             pass
 

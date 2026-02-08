@@ -135,3 +135,124 @@ def cleanup_chromium_singleton_dirs(
                 shutil.rmtree(str(d), ignore_errors=True)
         except Exception:
             pass
+
+
+def _posix_ps_command_output() -> str:
+    """
+    Return a best-effort snapshot of all process command lines.
+
+    Used to avoid deleting temp directories that are actively referenced by a running browser.
+    """
+    if os.name != "posix":
+        return ""
+    try:
+        # -ww: don't truncate long command lines (important for long temp paths).
+        proc = subprocess.run(
+            ["ps", "axww", "-o", "command="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        return proc.stdout or ""
+    except Exception:
+        return ""
+
+
+def _looks_like_chrome_user_data_dir(path: pathlib.Path) -> bool:
+    try:
+        # Common top-level artifacts in Chrome/Chromium user-data-dir.
+        if (path / "Local State").is_file():
+            return True
+        if (path / "Default").is_dir():
+            return True
+        if (path / "Last Version").is_file():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_empty_dir(path: pathlib.Path) -> bool:
+    try:
+        with os.scandir(str(path)) as it:
+            return next(it, None) is None
+    except Exception:
+        return False
+
+
+def cleanup_legacy_uc_profile_dirs(
+    *,
+    min_age_seconds: float = 120.0,
+) -> None:
+    """
+    Clean up stale legacy nodriver temp profiles directly under the system temp dir.
+
+    Older nodriver versions created temp profiles like:
+      $TMPDIR/uc_<random>/
+
+    The current code stores profiles under $TMPDIR/nodriver/profiles, but the old
+    directories can still exist and accumulate until the disk fills.
+
+    Safety:
+    - Only touches direct children of `tempfile.gettempdir()` whose name starts with "uc_".
+    - Only deletes directories that look like a Chrome user-data-dir or are empty.
+    - Skips directories referenced by a running process command line containing --user-data-dir=<path>.
+    - Skips very recent directories to avoid races with a concurrently starting browser.
+    """
+    tmp_dir = pathlib.Path(tempfile.gettempdir())
+    now = time.time()
+    ps_out = _posix_ps_command_output()
+
+    try:
+        entries = list(os.scandir(str(tmp_dir)))
+    except Exception:
+        return
+
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            name = entry.name
+            if not name.startswith("uc_"):
+                continue
+            path = pathlib.Path(entry.path)
+
+            try:
+                st = entry.stat(follow_symlinks=False)
+                age = now - float(st.st_mtime)
+            except Exception:
+                age = min_age_seconds
+
+            if age < min_age_seconds:
+                continue
+
+            if not (_is_empty_dir(path) or _looks_like_chrome_user_data_dir(path)):
+                continue
+
+            # Skip anything that looks active.
+            if ps_out:
+                real = os.path.realpath(str(path))
+                needles = (
+                    f"--user-data-dir={path}",
+                    f"--user-data-dir={real}",
+                    f"--user-data-dir {path}",
+                    f"--user-data-dir {real}",
+                )
+                if any(n in ps_out for n in needles):
+                    continue
+
+            try:
+                if os.name == "posix" and os.path.exists("/bin/rm"):
+                    subprocess.run(
+                        ["/bin/rm", "-rf", str(path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                else:
+                    shutil.rmtree(str(path), ignore_errors=True)
+            except Exception:
+                pass
+        except Exception:
+            continue
