@@ -25,6 +25,7 @@ from typing import List, Tuple, Union
 
 from .. import cdp
 from . import tab, util
+from ._temp import cleanup_chromium_singleton_dirs
 from ._contradict import ContraDict
 from .config import Config, PathLike, is_posix
 from .connection import Connection
@@ -385,6 +386,13 @@ class Browser:
                 self.config.port = util.free_port()
 
             if not connect_existing:
+                # Proactively remove stale Chromium/Chrome singleton socket dirs in the system temp dir.
+                # These can leak on crashes/forced kills and accumulate on long-running workloads.
+                try:
+                    cleanup_chromium_singleton_dirs()
+                except Exception:
+                    pass
+
                 logger.debug(
                     "BROWSER EXECUTABLE PATH: %s", self.config.browser_executable_path
                 )
@@ -866,6 +874,13 @@ class Browser:
                             )
                             break
                         time.sleep(0.25)
+        except Exception:
+            pass
+
+        # Clean up any stale Chromium/Chrome singleton socket dirs in the system temp dir.
+        # These can leak on crashes/forced kills and are not under the profile directory.
+        try:
+            cleanup_chromium_singleton_dirs()
         except Exception:
             pass
 
