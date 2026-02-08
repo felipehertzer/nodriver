@@ -21,6 +21,7 @@ import nodriver.core.browser
 
 from .. import cdp
 from . import element, util
+from ._temp import nodriver_temp_dir
 from .config import PathLike
 from .connection import Connection, ProtocolException
 
@@ -1710,8 +1711,9 @@ class Tab(Connection):
             """
             )
             return
-        try:
+        import tempfile
 
+        try:
             if template_image:
                 template_image = Path(template_image)
                 if not template_image.exists():
@@ -1719,42 +1721,42 @@ class Tab(Connection):
                         "%s was not found in the current location : %s"
                         % (template_image, os.getcwd())
                     )
-            await self.save_screenshot("screen.jpg")
-            await self.sleep(0.05)
-            im = cv2.imread("screen.jpg")
-            im_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-            if template_image:
-                template = cv2.imread(str(template_image))
-            else:
-                with open("cf_template.png", "w+b") as fh:
-                    fh.write(util.get_cf_template())
-                template = cv2.imread("cf_template.png")
-            template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-            match = cv2.matchTemplate(im_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-            (min_v, max_v, min_l, max_l) = cv2.minMaxLoc(match)
-            (xs, ys) = max_l
-            tmp_h, tmp_w = template_gray.shape[:2]
-            xe = xs + tmp_w
-            ye = ys + tmp_h
-            cx = (xs + xe) // 2
-            cy = (ys + ye) // 2
-            return cx, cy
+
+            # Never write helper files into the user's CWD.
+            with tempfile.TemporaryDirectory(
+                prefix="nodriver_", dir=str(nodriver_temp_dir("tmp"))
+            ) as td:
+                tmp_dir = Path(td)
+                screenshot_path = tmp_dir / "screen.jpg"
+                template_path = tmp_dir / "cf_template.png"
+
+                await self.save_screenshot(str(screenshot_path))
+                await self.sleep(0.05)
+                im = cv2.imread(str(screenshot_path))
+                im_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+                if template_image:
+                    template = cv2.imread(str(template_image))
+                else:
+                    template_path.write_bytes(util.get_cf_template())
+                    template = cv2.imread(str(template_path))
+
+                template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+                match = cv2.matchTemplate(im_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+                (min_v, max_v, min_l, max_l) = cv2.minMaxLoc(match)
+                (xs, ys) = max_l
+                tmp_h, tmp_w = template_gray.shape[:2]
+                xe = xs + tmp_w
+                ye = ys + tmp_h
+                cx = (xs + xe) // 2
+                cy = (ys + ye) // 2
+                return cx, cy
         except (TypeError, OSError, PermissionError):
             pass  # ignore these exceptions
         except:  # noqa - don't ignore other exceptions
             raise
         finally:
-            try:
-                os.unlink("screen.jpg")
-            except:
-                logger.warning("could not unlink temporary screenshot")
-            if template_image:
-                pass
-            else:
-                try:
-                    os.unlink("cf_template.png")
-                except:  # noqa
-                    logger.warning("could not unlink template file cf_template.png")
+            # TemporaryDirectory handles cleanup.
+            pass
 
     async def bypass_insecure_connection_warning(self):
         """

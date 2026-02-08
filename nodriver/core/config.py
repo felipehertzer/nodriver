@@ -14,6 +14,8 @@ import tempfile
 import zipfile
 from typing import List, Optional, TypeVar
 
+from ._temp import nodriver_temp_dir
+
 __all__ = [
     "Config",
     "find_chrome_executable",
@@ -190,7 +192,9 @@ class Config:
         for src in self._extension_sources:
             if src.is_file():
                 tf = tempfile.mkdtemp(
-                    prefix="extension_", suffix=secrets.token_hex(4)
+                    prefix="extension_",
+                    suffix=secrets.token_hex(4),
+                    dir=str(nodriver_temp_dir("extensions")),
                 )
                 try:
                     with zipfile.ZipFile(src, "r") as z:
@@ -237,8 +241,16 @@ class Config:
         args += [f"--disable-features={disabled_features}"]
         if self._extensions:
             # Prepared by _prepare_extensions() (called by Browser.start()).
-            args += ["--load-extension=%s" % ",".join(str(_) for _ in self._extensions)]
-            args += ["--enable-unsafe-extension-debugging"]
+            # If a user explicitly sets --load-extension themselves, don't add ours.
+            if not any(str(a).startswith("--load-extension") for a in self._browser_args):
+                args += [
+                    "--load-extension=%s" % ",".join(str(_) for _ in self._extensions)
+                ]
+            if not any(
+                str(a).startswith("--enable-unsafe-extension-debugging")
+                for a in self._browser_args
+            ):
+                args += ["--enable-unsafe-extension-debugging"]
         if self.expert:
             args += ["--disable-site-isolation-trials"]
         if self._browser_args:
@@ -304,7 +316,9 @@ def is_root():
 
 def temp_profile_dir():
     """generate a temp dir (path)"""
-    path = os.path.normpath(tempfile.mkdtemp(prefix="uc_"))
+    path = os.path.normpath(
+        tempfile.mkdtemp(prefix="uc_", dir=str(nodriver_temp_dir("profiles")))
+    )
     return path
 
 

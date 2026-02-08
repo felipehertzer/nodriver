@@ -13,6 +13,10 @@ import logging
 import os
 import pathlib
 import pickle
+import shutil
+import signal
+import subprocess
+import time
 import urllib.parse
 import urllib.request
 import warnings
@@ -55,7 +59,7 @@ class Browser:
 
     """
 
-    _process: asyncio.subprocess.Process
+    _process: subprocess.Popen | None
     _process_pid: int
     _http: HTTPApi = None
     _cookies: CookieJar = None
@@ -149,8 +153,8 @@ class Browser:
 
     @property
     def stopped(self):
-        if self._process and self._process.returncode is None:
-            return False
+        if self._process:
+            return self._process.poll() is not None
         return True
         # return (self._process and self._process.returncode) or False
 
@@ -361,114 +365,129 @@ class Browser:
             return
 
         if self._process or self._process_pid:
-            if self._process.returncode is not None:
+            if self._process and self._process.poll() is not None:
                 return await self.create(config=self.config)
             warnings.warn("ignored! this call has no effect when already running.")
             return
 
-        # self.config.update(kwargs)
-        connect_existing = False
-        if self.config.host is not None and self.config.port is not None:
-            connect_existing = True
-        else:
-            self.config.host = "127.0.0.1"
-            self.config.port = util.free_port()
+        try:
+            # self.config.update(kwargs)
+            connect_existing = False
+            if self.config.host is not None and self.config.port is not None:
+                connect_existing = True
+            else:
+                self.config.host = "127.0.0.1"
+                self.config.port = util.free_port()
 
-        if not connect_existing:
-            logger.debug(
-                "BROWSER EXECUTABLE PATH: %s", self.config.browser_executable_path
+            if not connect_existing:
+                logger.debug(
+                    "BROWSER EXECUTABLE PATH: %s", self.config.browser_executable_path
+                )
+                if not pathlib.Path(self.config.browser_executable_path).exists():
+                    raise FileNotFoundError(
+                        (
+                            """
+                        ---------------------
+                        Could not determine browser executable.
+                        ---------------------
+                        Make sure your browser is installed in the default location (path).
+                        If you are sure about the browser executable, you can specify it using
+                        the `browser_executable_path='{}` parameter."""
+                        ).format(
+                            "/path/to/browser/executable"
+                            if is_posix
+                            else "c:/path/to/your/browser.exe"
+                        )
+                    )
+
+            if getattr(self.config, "_extension_sources", None):
+                # Prepare any packaged extensions (extract to temp dirs) for this run.
+                if len(self.config._extension_sources):  # type: ignore[attr-defined]
+                    self.config._prepare_extensions()  # type: ignore[attr-defined]
+
+            exe = self.config.browser_executable_path
+            params = self.config()
+
+            logger.info(
+                "starting\n\texecutable :%s\n\narguments:\n%s", exe, "\n\t".join(params)
             )
-            if not pathlib.Path(self.config.browser_executable_path).exists():
-                raise FileNotFoundError(
+            if not connect_existing:
+                # Use subprocess.Popen so Browser.stop() can reliably wait synchronously,
+                # even when called from inside an already-running event loop.
+                popen_kwargs = dict(
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=is_posix,
+                )
+                if is_posix:
+                    popen_kwargs["start_new_session"] = True
+                else:
+                    # On Windows, start a new process group so we can terminate child processes too.
+                    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                        popen_kwargs[
+                            "creationflags"
+                        ] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+                self._process = subprocess.Popen([exe, *params], **popen_kwargs)
+                self._process_pid = self._process.pid
+
+            self._http = HTTPApi((self.config.host, self.config.port))
+            util.get_registered_instances().add(self)
+            await asyncio.sleep(0.25)
+            for _ in range(5):
+                try:
+                    self.info = ContraDict(await self._http.get("version"), silent=True)
+                except (Exception,):
+                    if _ == 4:
+                        logger.debug("could not start", exc_info=True)
+                    await asyncio.sleep(0.5)
+                else:
+                    break
+
+            if not self.info:
+                raise Exception(
                     (
                         """
                     ---------------------
-                    Could not determine browser executable.
+                    Failed to connect to browser
                     ---------------------
-                    Make sure your browser is installed in the default location (path).
-                    If you are sure about the browser executable, you can specify it using
-                    the `browser_executable_path='{}` parameter."""
-                    ).format(
-                        "/path/to/browser/executable"
-                        if is_posix
-                        else "c:/path/to/your/browser.exe"
+                    One of the causes could be when you are running as root.
+                    In that case you need to pass no_sandbox=True 
+                    """
                     )
                 )
 
-        if getattr(self.config, "_extensions", None):  # noqa
-            self.config.add_argument(
-                "--load-extension=%s"
-                % ",".join(str(_) for _ in self.config._extensions)
-            )  # noqa
+            self.connection = Connection(self.info.webSocketDebuggerUrl, browser=self)
 
-        exe = self.config.browser_executable_path
-        params = self.config()
+            if self.config.autodiscover_targets:
+                logger.info("enabling autodiscover targets")
 
-        logger.info(
-            "starting\n\texecutable :%s\n\narguments:\n%s", exe, "\n\t".join(params)
-        )
-        if not connect_existing:
-            self._process: asyncio.subprocess.Process = (
-                await asyncio.create_subprocess_exec(
-                    # self.config.browser_executable_path,
-                    # *cmdparams,
-                    exe,
-                    *params,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    close_fds=is_posix,
+                self.connection.handlers[cdp.target.TargetInfoChanged] = [
+                    self._handle_target_update
+                ]
+                self.connection.handlers[cdp.target.TargetCreated] = [
+                    self._handle_target_update
+                ]
+                self.connection.handlers[cdp.target.TargetDestroyed] = [
+                    self._handle_target_update
+                ]
+                self.connection.handlers[cdp.target.TargetCrashed] = [
+                    self._handle_target_update
+                ]
+                await self.connection.send(
+                    cdp.target.set_discover_targets(discover=True)
                 )
-            )
-            self._process_pid = self._process.pid
 
-        self._http = HTTPApi((self.config.host, self.config.port))
-        util.get_registered_instances().add(self)
-        await asyncio.sleep(0.25)
-        for _ in range(5):
+            await self.update_targets()
+            await self
+        except Exception:
+            # Avoid leaving a running Chrome process and a huge temp profile behind on startup failures.
             try:
-                self.info = ContraDict(await self._http.get("version"), silent=True)
-            except (Exception,):
-                if _ == 4:
-                    logger.debug("could not start", exc_info=True)
-                await asyncio.sleep(0.5)
-            else:
-                break
-
-        if not self.info:
-            raise Exception(
-                (
-                    """
-                ---------------------
-                Failed to connect to browser
-                ---------------------
-                One of the causes could be when you are running as root.
-                In that case you need to pass no_sandbox=True 
-                """
-                )
-            )
-
-        self.connection = Connection(self.info.webSocketDebuggerUrl, browser=self)
-
-        if self.config.autodiscover_targets:
-            logger.info("enabling autodiscover targets")
-
-            self.connection.handlers[cdp.target.TargetInfoChanged] = [
-                self._handle_target_update
-            ]
-            self.connection.handlers[cdp.target.TargetCreated] = [
-                self._handle_target_update
-            ]
-            self.connection.handlers[cdp.target.TargetDestroyed] = [
-                self._handle_target_update
-            ]
-            self.connection.handlers[cdp.target.TargetCrashed] = [
-                self._handle_target_update
-            ]
-            await self.connection.send(cdp.target.set_discover_targets(discover=True))
-
-        await self.update_targets()
-        await self
+                self.stop()
+            except Exception:
+                pass
+            raise
 
     async def grant_all_permissions(self):
         """
@@ -665,65 +684,163 @@ class Browser:
                     del self._i
 
     def stop(self):
-        try:
-            # asyncio.get_running_loop().create_task(self.connection.send(cdp.browser.close()))
+        """
+        Stop the browser process and clean up temporary artifacts.
 
-            asyncio.get_event_loop().create_task(self.connection.disconnect())
-            logger.debug("closed the connection using get_event_loop().create_task()")
-        except RuntimeError:
-            if self.connection:
+        This method is synchronous (no await) so it can be called from async code
+        without relying on pending tasks that might never run (e.g. when the loop
+        stops right after).
+        """
+        # Best-effort CDP close/disconnect (optional, since it requires an event loop).
+        if self.connection:
+            try:
+                # If there's no running loop, we can do a graceful close.
+                asyncio.run(self.connection.send(cdp.browser.close()))
+            except RuntimeError:
+                # Already in an event loop: don't block on async calls here.
+                pass
+            except Exception:
+                pass
+
+            try:
+                asyncio.run(self.connection.disconnect())
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
+
+        # Kill the browser process (and its children).
+        pid = self._process_pid or (self._process.pid if self._process else None)
+        proc = self._process
+
+        if proc and proc.poll() is None:
+            try:
+                if is_posix and pid:
+                    # If the process was started as a new session, pid is the process group id.
+                    try:
+                        if os.getpgid(pid) == pid:
+                            os.killpg(pid, signal.SIGTERM)
+                        else:
+                            proc.terminate()
+                    except Exception:
+                        proc.terminate()
+                else:
+                    proc.terminate()
+            except Exception:
+                pass
+
+            try:
+                proc.wait(timeout=5)
+            except Exception:
                 try:
-                    # asyncio.run(self.connection.send(cdp.browser.close()))
-                    asyncio.run(self.connection.disconnect())
-                    logger.debug("closed the connection using asyncio.run()")
+                    if is_posix and pid:
+                        try:
+                            if os.getpgid(pid) == pid:
+                                os.killpg(pid, signal.SIGKILL)
+                            else:
+                                proc.kill()
+                        except Exception:
+                            proc.kill()
+                    else:
+                        proc.kill()
                 except Exception:
                     pass
-
-        for _ in range(3):
-            try:
-                self._process.terminate()
-                logger.info(
-                    "terminated browser with pid %d successfully" % self._process.pid
-                )
-                break
-            except (Exception,):
                 try:
-                    self._process.kill()
-                    logger.info(
-                        "killed browser with pid %d successfully" % self._process.pid
-                    )
-                    break
-                except (Exception,):
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+        elif pid:
+            # We only have a PID (e.g. attached to an external Chrome instance).
+            # Use per-PID termination (never killpg here, as we don't control its process group).
+            try:
+                if is_posix:
                     try:
-                        if hasattr(self, "browser_process_pid"):
-                            os.kill(self._process_pid, 15)
-                            logger.info(
-                                "killed browser with pid %d using signal 15 successfully"
-                                % self._process.pid
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pid = None
+                    except Exception:
+                        pass
+
+                    if pid:
+                        deadline = time.time() + 5.0
+                        while time.time() < deadline:
+                            try:
+                                os.kill(pid, 0)
+                            except ProcessLookupError:
+                                pid = None
+                                break
+                            except Exception:
+                                break
+                            time.sleep(0.05)
+
+                    if pid:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pid = None
+                        except Exception:
+                            pass
+                else:
+                    # Windows: best-effort terminate process tree.
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/PID", str(pid), "/T", "/F"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        self._process = None
+        self._process_pid = None
+
+        # Remove from global registry (if present).
+        try:
+            util.get_registered_instances().discard(self)
+        except Exception:
+            pass
+
+        # Clean up extracted extension temp dirs.
+        try:
+            if self.config:
+                self.config.cleanup_extensions()
+        except Exception:
+            pass
+
+        # Clean up temp profile dir, but only when nodriver generated it.
+        try:
+            if self.config and not self.config.uses_custom_data_dir:
+                for attempt in range(10):
+                    try:
+                        shutil.rmtree(self.config.user_data_dir, ignore_errors=False)
+                        break
+                    except FileNotFoundError:
+                        break
+                    except Exception:
+                        if attempt == 9:
+                            logger.debug(
+                                "failed removing temp profile %s",
+                                self.config.user_data_dir,
+                                exc_info=True,
                             )
                             break
-                    except (TypeError,):
-                        logger.info("typerror", exc_info=True)
-                        pass
-                    except (PermissionError,):
-                        logger.info(
-                            "browser already stopped, or no permission to kill. skip"
-                        )
-                        pass
-                    except (ProcessLookupError,):
-                        logger.info("process lookup failure")
-                        pass
-                    except (Exception,):
-                        raise
-            self._process = None
-            self._process_pid = None
+                        time.sleep(0.25)
+        except Exception:
+            pass
 
     def __await__(self):
         # return ( asyncio.sleep(0)).__await__()
         return self.update_targets().__await__()
 
     def __del__(self):
-        pass
+        try:
+            if not self.stopped:
+                self.stop()
+        except Exception:
+            pass
 
 
 class CookieJar:

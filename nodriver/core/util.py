@@ -11,6 +11,7 @@ import asyncio
 import logging
 import shutil
 import types
+import weakref
 from ssl import SSLContext
 from typing import (TYPE_CHECKING, Any, Callable, Generator, List, Optional,
                     Set, Tuple, TypeVar, Union)
@@ -23,7 +24,9 @@ if TYPE_CHECKING:
 from .. import cdp
 from .config import Config
 
-__registered__instances__: Set[Browser] = set()
+# Keep weak references so long-running processes don't accumulate Browser instances
+# and their temp profiles until interpreter exit.
+__registered__instances__ = weakref.WeakSet()
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -159,11 +162,21 @@ def deconstruct_browser(browser: Browser = None):
     if browser is not None:
 
         async def deconstruct(b: Browser):
-            if not b.stopped:
-                b.stop()
+            try:
+                if not b.stopped:
+                    b.stop()
+            finally:
+                try:
+                    __registered__instances__.discard(b)
+                except Exception:
+                    pass
             config = b.config
+            try:
+                config.cleanup_extensions()
+            except Exception:
+                pass
             if not config.uses_custom_data_dir:
-                for _ in range(3):
+                for _ in range(5):
                     try:
                         shutil.rmtree(config.user_data_dir, ignore_errors=False)
                         print(
@@ -176,9 +189,17 @@ def deconstruct_browser(browser: Browser = None):
 
         return asyncio.get_running_loop().create_task(deconstruct(browser))
 
-    for _ in __registered__instances__:
-        if not _.stopped:
-            _.stop()
+    for _ in list(__registered__instances__):
+        try:
+            if not _.stopped:
+                _.stop()
+        except Exception:
+            pass
+        try:
+            if _.config:
+                _.config.cleanup_extensions()
+        except Exception:
+            pass
         for attempt in range(5):
             try:
                 if _.config and not _.config.uses_custom_data_dir:
