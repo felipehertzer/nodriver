@@ -691,23 +691,25 @@ class Browser:
         without relying on pending tasks that might never run (e.g. when the loop
         stops right after).
         """
-        # Best-effort CDP close/disconnect (optional, since it requires an event loop).
+        # Best-effort websocket disconnect.
+        # Do not attempt CDP Browser.close here: it can hang forever if Chrome is already wedged.
         if self.connection:
             try:
-                # If there's no running loop, we can do a graceful close.
-                asyncio.run(self.connection.send(cdp.browser.close()))
+                loop = asyncio.get_running_loop()
             except RuntimeError:
-                # Already in an event loop: don't block on async calls here.
-                pass
-            except Exception:
-                pass
+                loop = None
 
-            try:
-                asyncio.run(self.connection.disconnect())
-            except RuntimeError:
-                pass
-            except Exception:
-                pass
+            if loop and loop.is_running():
+                try:
+                    loop.create_task(self.connection.disconnect())
+                except Exception:
+                    pass
+            else:
+                try:
+                    asyncio.run(asyncio.wait_for(self.connection.disconnect(), timeout=2))
+                except BaseException:
+                    # CancelledError is a BaseException on modern Python versions.
+                    pass
 
         # Kill the browser process (and its children).
         pid = self._process_pid or (self._process.pid if self._process else None)
@@ -815,7 +817,21 @@ class Browser:
             if self.config and not self.config.uses_custom_data_dir:
                 for attempt in range(10):
                     try:
-                        shutil.rmtree(self.config.user_data_dir, ignore_errors=False)
+                        # Using /bin/rm is much faster than shutil.rmtree for huge Chrome profiles.
+                        if is_posix:
+                            profile_path = str(self.config.user_data_dir)
+                            subprocess.run(
+                                ["/bin/rm", "-rf", profile_path],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                            )
+                            if os.path.exists(profile_path):
+                                raise OSError("temp profile dir still exists")
+                        else:
+                            shutil.rmtree(
+                                self.config.user_data_dir, ignore_errors=False
+                            )
                         break
                     except FileNotFoundError:
                         break
@@ -830,6 +846,23 @@ class Browser:
                         time.sleep(0.25)
         except Exception:
             pass
+
+    async def aclose(self, timeout: float = 5.0):
+        """
+        Async-friendly close helper.
+
+        This is useful for codebases that expect an awaitable close method (e.g. `await browser.aclose()`).
+        It is resilient to cancellation and always falls back to killing the process + deleting temp dirs.
+        """
+        try:
+            if self.connection:
+                try:
+                    await asyncio.wait_for(self.connection.disconnect(), timeout=timeout)
+                except BaseException:
+                    pass
+        finally:
+            # Ensure the process is killed and temp dirs are removed even if aclose() is cancelled.
+            self.stop()
 
     def __await__(self):
         # return ( asyncio.sleep(0)).__await__()

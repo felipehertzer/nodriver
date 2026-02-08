@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
+import subprocess
 import types
 import weakref
 from ssl import SSLContext
@@ -22,7 +24,7 @@ if TYPE_CHECKING:
     from .browser import Browser, PathLike
 
 from .. import cdp
-from .config import Config
+from .config import Config, is_posix
 
 # Keep weak references so long-running processes don't accumulate Browser instances
 # and their temp profiles until interpreter exit.
@@ -178,7 +180,17 @@ def deconstruct_browser(browser: Browser = None):
             if not config.uses_custom_data_dir:
                 for _ in range(5):
                     try:
-                        shutil.rmtree(config.user_data_dir, ignore_errors=False)
+                        if is_posix:
+                            subprocess.run(
+                                ["/bin/rm", "-rf", str(config.user_data_dir)],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                            )
+                            if os.path.exists(str(config.user_data_dir)):
+                                raise OSError("temp profile dir still exists")
+                        else:
+                            shutil.rmtree(config.user_data_dir, ignore_errors=False)
                         print(
                             "successfully removed temp profile %s"
                             % config.user_data_dir
@@ -203,7 +215,17 @@ def deconstruct_browser(browser: Browser = None):
         for attempt in range(5):
             try:
                 if _.config and not _.config.uses_custom_data_dir:
-                    shutil.rmtree(_.config.user_data_dir, ignore_errors=False)
+                    if is_posix:
+                        subprocess.run(
+                            ["/bin/rm", "-rf", str(_.config.user_data_dir)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
+                        if os.path.exists(str(_.config.user_data_dir)):
+                            raise OSError("temp profile dir still exists")
+                    else:
+                        shutil.rmtree(_.config.user_data_dir, ignore_errors=False)
                     print(
                         "successfully removed temp profile %s" % _.config.user_data_dir
                     )
