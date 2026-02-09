@@ -16,6 +16,7 @@ import pickle
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -573,6 +574,7 @@ class Browser:
                 deadline = time.monotonic() + startup_timeout
                 await asyncio.sleep(0.25)
                 attempts = 0
+                last_exc_info = None
                 while time.monotonic() < deadline:
                     attempts += 1
                     try:
@@ -580,6 +582,7 @@ class Browser:
                             await self._http.get("version"), silent=True
                         )
                     except (Exception,):
+                        last_exc_info = sys.exc_info()
                         # If we started the process and it already exited, don't wait the full timeout.
                         if self._process and self._process.poll() is not None:
                             break
@@ -596,7 +599,7 @@ class Browser:
                         "could not start (attempts=%s, timeout=%ss)",
                         attempts,
                         startup_timeout,
-                        exc_info=True,
+                        exc_info=last_exc_info,
                     )
 
                 if self.info:

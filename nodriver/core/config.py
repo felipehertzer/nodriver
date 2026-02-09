@@ -32,6 +32,18 @@ PathLike = TypeVar("PathLike", bound=str | pathlib.Path)
 AUTO = None
 _UNSET = object()
 
+def _is_executable_file(path: str) -> bool:
+    try:
+        p = pathlib.Path(path)
+        if not p.is_file():
+            return False
+        # On POSIX, ensure the user can execute the binary (common container footgun).
+        if is_posix and not os.access(str(p), os.X_OK):
+            return False
+        return True
+    except Exception:
+        return False
+
 
 class Config:
     """
@@ -114,7 +126,7 @@ class Config:
                 or os.environ.get("HELIUM_EXECUTABLE_PATH")
                 or ""
             ).strip()
-            if env_path and os.path.exists(env_path):
+            if env_path and _is_executable_file(env_path):
                 browser_executable_path = env_path
             else:
                 browser_executable_path = find_chrome_executable()
