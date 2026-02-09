@@ -164,6 +164,8 @@ class Browser:
         self._process_pid = None
         # Path to the temporary file capturing browser stdout/stderr (if we started the process).
         self._browser_log_path = None
+        # Keep the browser log file on disk. Used to preserve logs on startup failures.
+        self._keep_browser_log = False
         self._keep_user_data_dir = None
         self._proxy_forwarders = []
         self._is_updating = asyncio.Event()
@@ -420,17 +422,29 @@ class Browser:
             # self.config.update(kwargs)
             # Reset any previous run's log path (it is cleaned up in stop()).
             self._browser_log_path = None
+            self._keep_browser_log = False
 
             # If the user set host+port explicitly we connect to that devtools endpoint.
             # If nodriver assigned host+port automatically in a previous run, we should still start
             # a fresh local browser on subsequent runs (Config objects are expected to be reusable).
             connect_existing = False
-            if (
-                self.config.host is not None
-                and self.config.port is not None
-                and not getattr(self.config, "_auto_host_port", False)
-            ):
-                connect_existing = True
+            if self.config.host is not None and self.config.port is not None:
+                auto = getattr(self.config, "_auto_host_port", None)
+                is_auto = False
+                try:
+                    if auto is True:
+                        is_auto = True
+                    elif (
+                        isinstance(auto, tuple)
+                        and len(auto) == 2
+                        and (self.config.host, self.config.port) == auto
+                    ):
+                        is_auto = True
+                except Exception:
+                    is_auto = False
+
+                if not is_auto:
+                    connect_existing = True
 
             # When Chrome can't start its sandbox (common in containers), it tends to exit immediately.
             # We'll retry once with `--no-sandbox` if the browser output suggests this is the cause.
@@ -442,21 +456,23 @@ class Browser:
                     self.config.host = "127.0.0.1"
                     self.config.port = util.free_port()
                     try:
-                        setattr(self.config, "_auto_host_port", True)
+                        setattr(
+                            self.config, "_auto_host_port", (self.config.host, self.config.port)
+                        )
                     except Exception:
                         pass
 
-                # Proactively remove stale Chromium/Chrome singleton socket dirs in the system temp dir.
-                # These can leak on crashes/forced kills and accumulate on long-running workloads.
-                try:
-                    cleanup_chromium_singleton_dirs()
-                except Exception:
-                    pass
-                # Clean up stale temp profiles left behind by crashes/forced kills.
-                try:
-                    cleanup_stale_uc_profile_dirs()
-                except Exception:
-                    pass
+                    # Proactively remove stale Chromium/Chrome singleton socket dirs in the system temp dir.
+                    # These can leak on crashes/forced kills and accumulate on long-running workloads.
+                    try:
+                        cleanup_chromium_singleton_dirs()
+                    except Exception:
+                        pass
+                    # Clean up stale temp profiles left behind by crashes/forced kills.
+                    try:
+                        cleanup_stale_uc_profile_dirs()
+                    except Exception:
+                        pass
 
                     logger.debug(
                         "BROWSER EXECUTABLE PATH: %s", self.config.browser_executable_path
@@ -649,6 +665,11 @@ class Browser:
                     message.append("Browser output (tail):")
                     message.append(log_tail_trimmed.rstrip())
                 if getattr(self, "_browser_log_path", None):
+                    # Preserve the full log for debugging; `stop()` will otherwise delete it.
+                    try:
+                        self._keep_browser_log = True
+                    except Exception:
+                        pass
                     message.append("")
                     message.append(f"Browser log file: {self._browser_log_path}")
 
@@ -1072,7 +1093,9 @@ class Browser:
             log_path = getattr(self, "_browser_log_path", None)
             keep_log = False
             try:
-                keep_log = bool(getattr(self.config, "keep_browser_log", False))
+                keep_log = bool(getattr(self, "_keep_browser_log", False)) or bool(
+                    getattr(self.config, "keep_browser_log", False)
+                )
             except Exception:
                 keep_log = False
 
@@ -1086,6 +1109,7 @@ class Browser:
                         "failed removing browser log %s", log_path, exc_info=True
                     )
             self._browser_log_path = None
+            self._keep_browser_log = False
         except Exception:
             pass
 

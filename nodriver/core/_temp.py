@@ -309,3 +309,15 @@ def cleanup_stale_uc_profile_dirs(
                     pass
             except Exception:
                 continue
+
+
+def cleanup_legacy_uc_profile_dirs(
+    *,
+    min_age_seconds: float = 120.0,
+) -> None:
+    """
+    Backwards-compatible alias.
+
+    Older nodriver versions exposed this helper as `cleanup_legacy_uc_profile_dirs()`.
+    """
+    cleanup_stale_uc_profile_dirs(min_age_seconds=min_age_seconds)
