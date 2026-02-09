@@ -181,78 +181,96 @@ def _is_empty_dir(path: pathlib.Path) -> bool:
         return False
 
 
-def cleanup_legacy_uc_profile_dirs(
+def cleanup_stale_uc_profile_dirs(
     *,
     min_age_seconds: float = 120.0,
 ) -> None:
     """
-    Clean up stale legacy nodriver temp profiles directly under the system temp dir.
+    Clean up stale nodriver temp profiles.
 
     Older nodriver versions created temp profiles like:
       $TMPDIR/uc_<random>/
 
-    The current code stores profiles under $TMPDIR/nodriver/profiles, but the old
-    directories can still exist and accumulate until the disk fills.
+    The current code stores profiles under:
+      $TMPDIR/nodriver/profiles/uc_<random>/
+
+    These directories can accumulate when processes crash or are force-killed.
 
     Safety:
-    - Only touches direct children of `tempfile.gettempdir()` whose name starts with "uc_".
+    - Only touches direct children of candidate temp directories whose name starts with "uc_".
     - Only deletes directories that look like a Chrome user-data-dir or are empty.
     - Skips directories referenced by a running process command line containing --user-data-dir=<path>.
     - Skips very recent directories to avoid races with a concurrently starting browser.
     """
-    tmp_dir = pathlib.Path(tempfile.gettempdir())
     now = time.time()
     ps_out = _posix_ps_command_output()
+    can_check_activity = bool(ps_out)
 
+    # Candidate bases:
+    # - System temp dir (legacy uc_ profiles)
+    # - Dedicated nodriver profiles dir (current)
+    bases = [pathlib.Path(tempfile.gettempdir())]
     try:
-        entries = list(os.scandir(str(tmp_dir)))
+        bases.append(nodriver_temp_dir("profiles"))
     except Exception:
-        return
+        pass
 
-    for entry in entries:
+    for base in bases:
         try:
-            if not entry.is_dir(follow_symlinks=False):
-                continue
-            name = entry.name
-            if not name.startswith("uc_"):
-                continue
-            path = pathlib.Path(entry.path)
-
-            try:
-                st = entry.stat(follow_symlinks=False)
-                age = now - float(st.st_mtime)
-            except Exception:
-                age = min_age_seconds
-
-            if age < min_age_seconds:
-                continue
-
-            if not (_is_empty_dir(path) or _looks_like_chrome_user_data_dir(path)):
-                continue
-
-            # Skip anything that looks active.
-            if ps_out:
-                real = os.path.realpath(str(path))
-                needles = (
-                    f"--user-data-dir={path}",
-                    f"--user-data-dir={real}",
-                    f"--user-data-dir {path}",
-                    f"--user-data-dir {real}",
-                )
-                if any(n in ps_out for n in needles):
-                    continue
-
-            try:
-                if os.name == "posix" and os.path.exists("/bin/rm"):
-                    subprocess.run(
-                        ["/bin/rm", "-rf", str(path)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                    )
-                else:
-                    shutil.rmtree(str(path), ignore_errors=True)
-            except Exception:
-                pass
+            entries = list(os.scandir(str(base)))
         except Exception:
             continue
+
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                name = entry.name
+                if not name.startswith("uc_"):
+                    continue
+                path = pathlib.Path(entry.path)
+
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    age = now - float(st.st_mtime)
+                except Exception:
+                    age = min_age_seconds
+
+                if age < min_age_seconds:
+                    continue
+
+                empty = _is_empty_dir(path)
+                looks_like_profile = _looks_like_chrome_user_data_dir(path)
+                if not (empty or looks_like_profile):
+                    continue
+
+                # If we can't determine activity safely, only delete empty dirs.
+                if not can_check_activity and not empty:
+                    continue
+
+                # Skip anything that looks active.
+                if can_check_activity:
+                    real = os.path.realpath(str(path))
+                    needles = (
+                        f"--user-data-dir={path}",
+                        f"--user-data-dir={real}",
+                        f"--user-data-dir {path}",
+                        f"--user-data-dir {real}",
+                    )
+                    if any(n in ps_out for n in needles):
+                        continue
+
+                try:
+                    if os.name == "posix" and os.path.exists("/bin/rm"):
+                        subprocess.run(
+                            ["/bin/rm", "-rf", str(path)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
+                    else:
+                        shutil.rmtree(str(path), ignore_errors=True)
+                except Exception:
+                    pass
+            except Exception:
+                continue

@@ -16,6 +16,7 @@ import pickle
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -25,12 +26,49 @@ from typing import List, Tuple, Union
 
 from .. import cdp
 from . import tab, util
-from ._temp import cleanup_chromium_singleton_dirs, cleanup_legacy_uc_profile_dirs
+from ._temp import (
+    cleanup_chromium_singleton_dirs,
+    cleanup_stale_uc_profile_dirs,
+    nodriver_temp_dir,
+)
 from ._contradict import ContraDict
 from .config import Config, PathLike, is_posix
 from .connection import Connection
 
 logger = logging.getLogger(__name__)
+
+
+def _tail_text_file(path: str, *, max_bytes: int = 24_000) -> str:
+    try:
+        with open(path, "rb") as f:
+            try:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max_bytes), os.SEEK_SET)
+            except Exception:
+                pass
+            data = f.read()
+    except Exception:
+        return ""
+
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _looks_like_sandbox_error(output: str) -> bool:
+    o = (output or "").lower()
+    # Chrome/Chromium commonly prints one of these when its sandbox can't start.
+    if "running as root without --no-sandbox" in o:
+        return True
+    if "no usable sandbox" in o:
+        return True
+    if "failed to move to new namespace" in o and "operation not permitted" in o:
+        return True
+    if "zygote_host_impl_linux" in o and "--no-sandbox" in o:
+        return True
+    return False
 
 
 class Browser:
@@ -124,6 +162,8 @@ class Browser:
         self._target = None
         self._process = None
         self._process_pid = None
+        # Path to the temporary file capturing browser stdout/stderr (if we started the process).
+        self._browser_log_path = None
         self._keep_user_data_dir = None
         self._proxy_forwarders = []
         self._is_updating = asyncio.Event()
@@ -378,104 +418,241 @@ class Browser:
 
         try:
             # self.config.update(kwargs)
-            connect_existing = False
-            if self.config.host is not None and self.config.port is not None:
-                connect_existing = True
-            else:
-                self.config.host = "127.0.0.1"
-                self.config.port = util.free_port()
+            # Reset any previous run's log path (it is cleaned up in stop()).
+            self._browser_log_path = None
 
-            if not connect_existing:
+            # If the user set host+port explicitly we connect to that devtools endpoint.
+            # If nodriver assigned host+port automatically in a previous run, we should still start
+            # a fresh local browser on subsequent runs (Config objects are expected to be reusable).
+            connect_existing = False
+            if (
+                self.config.host is not None
+                and self.config.port is not None
+                and not getattr(self.config, "_auto_host_port", False)
+            ):
+                connect_existing = True
+
+            # When Chrome can't start its sandbox (common in containers), it tends to exit immediately.
+            # We'll retry once with `--no-sandbox` if the browser output suggests this is the cause.
+            sandbox_retry_done = False
+
+            while True:
+                if not connect_existing:
+                    # Always pick a fresh port to avoid conflicts across retries / previous runs.
+                    self.config.host = "127.0.0.1"
+                    self.config.port = util.free_port()
+                    try:
+                        setattr(self.config, "_auto_host_port", True)
+                    except Exception:
+                        pass
+
                 # Proactively remove stale Chromium/Chrome singleton socket dirs in the system temp dir.
                 # These can leak on crashes/forced kills and accumulate on long-running workloads.
                 try:
                     cleanup_chromium_singleton_dirs()
                 except Exception:
                     pass
-                # Remove stale legacy temp profiles created by older nodriver versions directly
-                # under the system temp dir ($TMPDIR/uc_*).
+                # Clean up stale temp profiles left behind by crashes/forced kills.
                 try:
-                    cleanup_legacy_uc_profile_dirs()
+                    cleanup_stale_uc_profile_dirs()
                 except Exception:
                     pass
 
-                logger.debug(
-                    "BROWSER EXECUTABLE PATH: %s", self.config.browser_executable_path
-                )
-                if not pathlib.Path(self.config.browser_executable_path).exists():
-                    raise FileNotFoundError(
-                        (
-                            """
-                        ---------------------
-                        Could not determine browser executable.
-                        ---------------------
-                        Make sure your browser is installed in the default location (path).
-                        If you are sure about the browser executable, you can specify it using
-                        the `browser_executable_path='{}` parameter."""
-                        ).format(
-                            "/path/to/browser/executable"
-                            if is_posix
-                            else "c:/path/to/your/browser.exe"
+                    logger.debug(
+                        "BROWSER EXECUTABLE PATH: %s", self.config.browser_executable_path
+                    )
+                    if not pathlib.Path(self.config.browser_executable_path).exists():
+                        raise FileNotFoundError(
+                            (
+                                """
+                            ---------------------
+                            Could not determine browser executable.
+                            ---------------------
+                            Make sure your browser is installed in the default location (path).
+                            If you are sure about the browser executable, you can specify it using
+                            the `browser_executable_path='{}` parameter."""
+                            ).format(
+                                "/path/to/browser/executable"
+                                if is_posix
+                                else "c:/path/to/your/browser.exe"
+                            )
                         )
+
+                    if getattr(self.config, "_extension_sources", None):
+                        # Prepare any packaged extensions (extract to temp dirs) for this run.
+                        if len(self.config._extension_sources):  # type: ignore[attr-defined]
+                            self.config._prepare_extensions()  # type: ignore[attr-defined]
+
+                exe = self.config.browser_executable_path
+                params = self.config()
+
+                logger.info(
+                    "starting\n\texecutable :%s\n\narguments:\n%s",
+                    exe,
+                    "\n\t".join(params),
+                )
+
+                if not connect_existing:
+                    # Use subprocess.Popen so Browser.stop() can reliably wait synchronously,
+                    # even when called from inside an already-running event loop.
+                    popen_kwargs = dict(
+                        stdin=subprocess.DEVNULL,
+                        close_fds=is_posix,
                     )
 
-            if getattr(self.config, "_extension_sources", None):
-                # Prepare any packaged extensions (extract to temp dirs) for this run.
-                if len(self.config._extension_sources):  # type: ignore[attr-defined]
-                    self.config._prepare_extensions()  # type: ignore[attr-defined]
+                    # Capture browser stdout/stderr to a temp file so we can include the real
+                    # failure reason when startup fails (Chrome often exits quickly with an error).
+                    log_fh = None
+                    log_path = None
+                    try:
+                        fd, log_path = tempfile.mkstemp(
+                            prefix="browser_",
+                            suffix=".log",
+                            dir=str(nodriver_temp_dir("browser_logs")),
+                        )
+                        log_fh = os.fdopen(fd, "wb", buffering=0)
+                        popen_kwargs["stdout"] = log_fh
+                        popen_kwargs["stderr"] = log_fh
+                        self._browser_log_path = log_path
+                    except Exception:
+                        popen_kwargs["stdout"] = subprocess.DEVNULL
+                        popen_kwargs["stderr"] = subprocess.DEVNULL
+                        self._browser_log_path = None
 
-            exe = self.config.browser_executable_path
-            params = self.config()
+                    if is_posix:
+                        popen_kwargs["start_new_session"] = True
+                    else:
+                        # On Windows, start a new process group so we can terminate child processes too.
+                        if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                            popen_kwargs[
+                                "creationflags"
+                            ] = subprocess.CREATE_NEW_PROCESS_GROUP
 
-            logger.info(
-                "starting\n\texecutable :%s\n\narguments:\n%s", exe, "\n\t".join(params)
-            )
-            if not connect_existing:
-                # Use subprocess.Popen so Browser.stop() can reliably wait synchronously,
-                # even when called from inside an already-running event loop.
-                popen_kwargs = dict(
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    close_fds=is_posix,
-                )
-                if is_posix:
-                    popen_kwargs["start_new_session"] = True
+                    try:
+                        self._process = subprocess.Popen([exe, *params], **popen_kwargs)
+                        self._process_pid = self._process.pid
+                    finally:
+                        try:
+                            if log_fh:
+                                log_fh.close()
+                        except Exception:
+                            pass
+
+                self._http = HTTPApi((self.config.host, self.config.port))
+                util.get_registered_instances().add(self)
+
+                self.info = None
+                startup_timeout = getattr(self.config, "startup_timeout", None)
+                default_timeout = 10.0 if connect_existing else 30.0
+                if startup_timeout is None:
+                    startup_timeout = default_timeout
                 else:
-                    # On Windows, start a new process group so we can terminate child processes too.
-                    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-                        popen_kwargs[
-                            "creationflags"
-                        ] = subprocess.CREATE_NEW_PROCESS_GROUP
+                    try:
+                        startup_timeout = float(startup_timeout)
+                    except Exception:
+                        startup_timeout = default_timeout
+                if startup_timeout <= 0:
+                    startup_timeout = default_timeout
 
-                self._process = subprocess.Popen([exe, *params], **popen_kwargs)
-                self._process_pid = self._process.pid
+                deadline = time.monotonic() + startup_timeout
+                await asyncio.sleep(0.25)
+                attempts = 0
+                while time.monotonic() < deadline:
+                    attempts += 1
+                    try:
+                        self.info = ContraDict(
+                            await self._http.get("version"), silent=True
+                        )
+                    except (Exception,):
+                        # If we started the process and it already exited, don't wait the full timeout.
+                        if self._process and self._process.poll() is not None:
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        # Keep a small but non-zero backoff.
+                        await asyncio.sleep(min(0.5, max(0.05, remaining)))
+                    else:
+                        break
 
-            self._http = HTTPApi((self.config.host, self.config.port))
-            util.get_registered_instances().add(self)
-            await asyncio.sleep(0.25)
-            for _ in range(5):
-                try:
-                    self.info = ContraDict(await self._http.get("version"), silent=True)
-                except (Exception,):
-                    if _ == 4:
-                        logger.debug("could not start", exc_info=True)
-                    await asyncio.sleep(0.5)
-                else:
+                if not self.info:
+                    logger.debug(
+                        "could not start (attempts=%s, timeout=%ss)",
+                        attempts,
+                        startup_timeout,
+                        exc_info=True,
+                    )
+
+                if self.info:
                     break
 
-            if not self.info:
-                raise Exception(
-                    (
-                        """
-                    ---------------------
-                    Failed to connect to browser
-                    ---------------------
-                    One of the causes could be when you are running as root.
-                    In that case you need to pass no_sandbox=True 
-                    """
+                # Failed to connect: include real browser output if available.
+                log_tail = ""
+                if getattr(self, "_browser_log_path", None):
+                    log_tail = _tail_text_file(str(self._browser_log_path))
+
+                if (
+                    (not connect_existing)
+                    and (not sandbox_retry_done)
+                    and bool(getattr(self.config, "sandbox", True))
+                    and _looks_like_sandbox_error(log_tail)
+                ):
+                    sandbox_retry_done = True
+                    logger.info(
+                        "retrying browser start with sandbox disabled (--no-sandbox)"
                     )
+                    try:
+                        self.stop()
+                    except Exception:
+                        pass
+                    self.config.sandbox = False
+                    continue
+
+                proc_status = ""
+                if self._process:
+                    try:
+                        rc = self._process.poll()
+                        if rc is None:
+                            proc_status = (
+                                "browser process is running but the DevTools endpoint "
+                                "did not become ready"
+                            )
+                        else:
+                            proc_status = f"browser process exited with code {rc}"
+                    except Exception:
+                        pass
+
+                message = [
+                    "---------------------",
+                    "Failed to connect to browser",
+                    "---------------------",
+                    f"host={self.config.host!s} port={self.config.port!s}",
+                ]
+                if proc_status:
+                    message.append(proc_status)
+
+                # Guidance: sandbox vs. devtools attachment.
+                message.append(
+                    "If you're running in Docker/Kubernetes or as root, Chrome's sandbox may fail to start. "
+                    "Try `sandbox=False` (or legacy `no_sandbox=True`)."
                 )
+                if connect_existing:
+                    message.append(
+                        "You are connecting to an existing browser. Ensure Chrome was started with "
+                        "`--remote-debugging-port` and that the host/port are reachable."
+                    )
+
+                if log_tail:
+                    # Keep the exception readable: show only the tail.
+                    log_tail_trimmed = log_tail[-4000:]
+                    message.append("")
+                    message.append("Browser output (tail):")
+                    message.append(log_tail_trimmed.rstrip())
+                if getattr(self, "_browser_log_path", None):
+                    message.append("")
+                    message.append(f"Browser log file: {self._browser_log_path}")
+
+                raise Exception("\n".join(message))
 
             self.connection = Connection(self.info.webSocketDebuggerUrl, browser=self)
 
@@ -889,9 +1066,26 @@ class Browser:
             cleanup_chromium_singleton_dirs()
         except Exception:
             pass
-        # Clean up stale legacy temp profiles directly under the system temp dir.
+
+        # Clean up browser output capture file (if any).
         try:
-            cleanup_legacy_uc_profile_dirs()
+            log_path = getattr(self, "_browser_log_path", None)
+            keep_log = False
+            try:
+                keep_log = bool(getattr(self.config, "keep_browser_log", False))
+            except Exception:
+                keep_log = False
+
+            if log_path and not keep_log:
+                try:
+                    os.remove(str(log_path))
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    logger.debug(
+                        "failed removing browser log %s", log_path, exc_info=True
+                    )
+            self._browser_log_path = None
         except Exception:
             pass
 

@@ -30,6 +30,7 @@ is_posix = sys.platform.startswith(("darwin", "cygwin", "linux", "linux2"))
 
 PathLike = TypeVar("PathLike", bound=str | pathlib.Path)
 AUTO = None
+_UNSET = object()
 
 
 class Config:
@@ -82,6 +83,13 @@ class Config:
         :type lang: str
         :type kwargs: dict
         """
+
+        # Backwards-compatible alias:
+        # Historically the library (and its error messages/docs) referred to `no_sandbox=True`.
+        # The actual config knob is `sandbox` (where False adds --no-sandbox).
+        no_sandbox = kwargs.pop("no_sandbox", _UNSET)
+        if no_sandbox is not _UNSET and no_sandbox is not None:
+            sandbox = not bool(no_sandbox)
 
         if not browser_args:
             browser_args = []
@@ -138,6 +146,15 @@ class Config:
     @property
     def browser_args(self):
         return sorted(self._default_browser_args + self._browser_args)
+
+    @property
+    def no_sandbox(self) -> bool:
+        """Alias for `sandbox=False` (adds Chrome flag `--no-sandbox`)."""
+        return not bool(self.sandbox)
+
+    @no_sandbox.setter
+    def no_sandbox(self, value: bool) -> None:
+        self.sandbox = not bool(value)
 
     @property
     def user_data_dir(self):
