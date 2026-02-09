@@ -240,8 +240,11 @@ class Browser:
             current_tab = next(
                 filter(
                     lambda item: item.target_id == target_info.target_id, self.targets
-                )
+                ),
+                None,
             )
+            if current_tab is None:
+                return
             current_target = current_tab.target
 
             if logger.getEffectiveLevel() <= 10:
@@ -255,7 +258,7 @@ class Browser:
                     % (self.targets.index(current_tab), changes_string)
                 )
 
-                current_tab._target = target_info
+            current_tab._target = target_info
 
         elif isinstance(event, cdp.target.TargetCreated):
             target_info: cdp.target.TargetInfo = event.target_info
@@ -277,8 +280,11 @@ class Browser:
 
         elif isinstance(event, cdp.target.TargetDestroyed):
             current_tab = next(
-                filter(lambda item: item.target_id == event.target_id, self.targets)
+                filter(lambda item: item.target_id == event.target_id, self.targets),
+                None,
             )
+            if current_tab is None:
+                return
             logger.debug(
                 "target removed. id # %d => %s"
                 % (self.targets.index(current_tab), current_tab)
@@ -313,15 +319,23 @@ class Browser:
                 filter(
                     lambda item: item.type_ == "page" and item.target_id == target_id,
                     self.targets,
-                )
+                ),
+                None,
             )
+            if connection is None:
+                raise RuntimeError(
+                    "newly created target %s not found in targets list" % target_id
+                )
             connection._browser = self
 
         else:
             # first tab from browser.tabs
             connection: tab.Tab = next(
-                filter(lambda item: item.type_ == "page", self.targets)
+                filter(lambda item: item.type_ == "page", self.targets),
+                None,
             )
+            if connection is None:
+                raise RuntimeError("no page target found in browser")
             # use the tab to navigate to new url
             frame_id, loader_id, *_ = await connection.send(cdp.page.navigate(url))
             # update the frame_id on the tab
@@ -403,8 +417,13 @@ class Browser:
             filter(
                 lambda item: item.type_ == "page" and item.target_id == target_id,
                 self.targets,
-            )
+            ),
+            None,
         )
+        if connection is None:
+            raise RuntimeError(
+                "newly created context target %s not found in targets list" % target_id
+            )
         return connection
 
     async def start(self=None) -> Browser:
