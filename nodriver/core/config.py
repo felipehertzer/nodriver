@@ -100,8 +100,24 @@ class Config:
         else:
             self.user_data_dir = user_data_dir
 
-        if not browser_executable_path:
-            browser_executable_path = find_chrome_executable()
+        # When attaching to an existing DevTools endpoint (host+port provided),
+        # a local Chrome executable is not required.
+        if not browser_executable_path and not (host and port):
+            # Allow container-friendly configuration via env var as a fallback
+            # (useful when the browser isn't on PATH, e.g. Helium in /opt/helium/chrome).
+            env_path = (
+                os.environ.get("BROWSER_EXECUTABLE_PATH")
+                or os.environ.get("CHROME_EXECUTABLE_PATH")
+                or os.environ.get("CHROME_PATH")
+                or os.environ.get("CHROMIUM_PATH")
+                or os.environ.get("BRAVE_EXECUTABLE_PATH")
+                or os.environ.get("HELIUM_EXECUTABLE_PATH")
+                or ""
+            ).strip()
+            if env_path and os.path.exists(env_path):
+                browser_executable_path = env_path
+            else:
+                browser_executable_path = find_chrome_executable()
 
         self._browser_args = browser_args
 

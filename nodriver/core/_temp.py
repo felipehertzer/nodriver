@@ -75,9 +75,9 @@ def _socket_is_listening(sock_path: pathlib.Path, timeout: float = 0.15) -> bool
         # Unknown state; be conservative and don't delete.
         return True
 
-    # If it's not a unix socket, don't try to interpret it.
+    # If Chromium left behind a non-socket file here, treat it as stale.
     if not stat.S_ISSOCK(st.st_mode):
-        return True
+        return False
 
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -159,6 +159,41 @@ def _posix_ps_command_output() -> str:
         return ""
 
 
+def _posix_proc_cmdline_snapshot() -> str:
+    """
+    Fallback cmdline snapshot for minimal containers where `ps` isn't available.
+
+    We only need a coarse "is any process referencing this path" signal, so a single
+    concatenated string is sufficient and keeps call sites simple.
+    """
+    if os.name != "posix":
+        return ""
+    proc_dir = pathlib.Path("/proc")
+    if not proc_dir.exists():
+        return ""
+    out: list[str] = []
+    try:
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            cmdline = entry / "cmdline"
+            try:
+                data = cmdline.read_bytes()
+            except Exception:
+                continue
+            if not data:
+                continue
+            # /proc/<pid>/cmdline is NUL-separated.
+            try:
+                s = data.replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            out.append(s)
+    except Exception:
+        return ""
+    return "\n".join(out)
+
+
 def _looks_like_chrome_user_data_dir(path: pathlib.Path) -> bool:
     try:
         # Common top-level artifacts in Chrome/Chromium user-data-dir.
@@ -203,7 +238,7 @@ def cleanup_stale_uc_profile_dirs(
     - Skips very recent directories to avoid races with a concurrently starting browser.
     """
     now = time.time()
-    ps_out = _posix_ps_command_output()
+    ps_out = _posix_ps_command_output() or _posix_proc_cmdline_snapshot()
     can_check_activity = bool(ps_out)
 
     # Candidate bases:
