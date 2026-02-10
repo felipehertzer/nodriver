@@ -30,6 +30,19 @@ is_posix = sys.platform.startswith(("darwin", "cygwin", "linux", "linux2"))
 
 PathLike = TypeVar("PathLike", bound=str | pathlib.Path)
 AUTO = None
+_UNSET = object()
+
+def _is_executable_file(path: str) -> bool:
+    try:
+        p = pathlib.Path(path)
+        if not p.is_file():
+            return False
+        # On POSIX, ensure the user can execute the binary (common container footgun).
+        if is_posix and not os.access(str(p), os.X_OK):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 class Config:
@@ -83,6 +96,13 @@ class Config:
         :type kwargs: dict
         """
 
+        # Backwards-compatible alias:
+        # Historically the library (and its error messages/docs) referred to `no_sandbox=True`.
+        # The actual config knob is `sandbox` (where False adds --no-sandbox).
+        no_sandbox = kwargs.pop("no_sandbox", _UNSET)
+        if no_sandbox is not _UNSET and no_sandbox is not None:
+            sandbox = not bool(no_sandbox)
+
         if not browser_args:
             browser_args = []
 
@@ -92,8 +112,24 @@ class Config:
         else:
             self.user_data_dir = user_data_dir
 
-        if not browser_executable_path:
-            browser_executable_path = find_chrome_executable()
+        # When attaching to an existing DevTools endpoint (host+port provided),
+        # a local Chrome executable is not required.
+        if not browser_executable_path and not (host and port):
+            # Allow container-friendly configuration via env var as a fallback
+            # (useful when the browser isn't on PATH, e.g. Helium in /opt/helium/chrome).
+            env_path = (
+                os.environ.get("BROWSER_EXECUTABLE_PATH")
+                or os.environ.get("CHROME_EXECUTABLE_PATH")
+                or os.environ.get("CHROME_PATH")
+                or os.environ.get("CHROMIUM_PATH")
+                or os.environ.get("BRAVE_EXECUTABLE_PATH")
+                or os.environ.get("HELIUM_EXECUTABLE_PATH")
+                or ""
+            ).strip()
+            if env_path and _is_executable_file(env_path):
+                browser_executable_path = env_path
+            else:
+                browser_executable_path = find_chrome_executable()
 
         self._browser_args = browser_args
 
@@ -138,6 +174,15 @@ class Config:
     @property
     def browser_args(self):
         return sorted(self._default_browser_args + self._browser_args)
+
+    @property
+    def no_sandbox(self) -> bool:
+        """Alias for `sandbox=False` (adds Chrome flag `--no-sandbox`)."""
+        return not bool(self.sandbox)
+
+    @no_sandbox.setter
+    def no_sandbox(self, value: bool) -> None:
+        self.sandbox = not bool(value)
 
     @property
     def user_data_dir(self):

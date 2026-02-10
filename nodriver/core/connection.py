@@ -292,8 +292,9 @@ class Connection(metaclass=CantTouchThis):
         if handler:
             for event, callbacks in self.handlers.items():
                 for cb in callbacks:
-                    if cb == self:
+                    if cb == handler:
                         self.handlers[event].remove(handler)
+                        break
 
         if not isinstance(event_type_or_domain, list):
             event_type_or_domain = [event_type_or_domain]
@@ -348,6 +349,18 @@ class Connection(metaclass=CantTouchThis):
         if listener and listener is not asyncio.current_task() and not listener.done():
             listener.cancel()
             await asyncio.gather(listener, return_exceptions=True)
+
+        # Cancel all pending Transaction futures so tasks awaiting CDP
+        # responses (e.g. update_targets) can exit instead of hanging.
+        try:
+            pending_txns = list(self.mapper.values())
+            self.mapper.clear()
+            for tx in pending_txns:
+                if not tx.done():
+                    tx.cancel()
+        except Exception:
+            pass
+
         if self.websocket:
             self.enabled_domains.clear()
             try:
@@ -441,10 +454,8 @@ class Connection(metaclass=CantTouchThis):
             except ProtocolException:
                 break
             except websockets.exceptions.ConnectionClosedOK:
-                await self.disconnect()
                 break
             except websockets.exceptions.ConnectionClosed:
-                await self.disconnect()
                 break
             except asyncio.TimeoutError as e:
                 await asyncio.sleep(0.05)
@@ -465,15 +476,15 @@ class Connection(metaclass=CantTouchThis):
                     # probably an event
                     try:
                         event = cdp.util.parse_json_event(message)
+                    except KeyError as e:
+                        logger.info("KeyError during event parsing: %s" % e, exc_info=True)
+                        continue
                     except Exception as e:
                         logger.info(
                             "%s: %s  during parsing of json from event : %s"
                             % (type(e).__name__, e.args, message),
                             exc_info=True,
                         )
-                        continue
-                    except KeyError as e:
-                        logger.info("some lousy KeyError %s" % e, exc_info=True)
                         continue
                     try:
                         if type(event) in self.handlers:
@@ -533,7 +544,11 @@ class Connection(metaclass=CantTouchThis):
         tx.id = the_id
         self.mapper[the_id] = tx
         # Apply backpressure: avoid spawning unbounded send tasks when issuing lots of commands.
-        await self.websocket.send(tx.message)
+        try:
+            await self.websocket.send(tx.message)
+        except Exception:
+            self.mapper.pop(the_id, None)
+            raise
         return await tx
 
     async def _send_oneshot(self, cdp_obj):
