@@ -947,16 +947,25 @@ class Browser:
         except Exception:
             pass
 
-        # Clean up the websocket connection synchronously.
+        # Clean up the websocket connections synchronously.
         # We avoid fire-and-forget async tasks here because the event loop
         # may be closed immediately after stop() returns, leaving those tasks
         # as "destroyed but pending".
+        # Each Tab also has its own websocket connection (listener + keepalive),
+        # so we must clean up all of them, not just self.connection.
+        connections_to_close = []
         if self.connection:
+            connections_to_close.append(self.connection)
+        for t in list(getattr(self, 'targets', None) or []):
+            if hasattr(t, 'websocket') and t is not self.connection:
+                connections_to_close.append(t)
+
+        for conn in connections_to_close:
             # 1. Cancel all pending Transaction futures so tasks awaiting CDP
             #    responses (e.g. update_targets) can exit immediately.
             try:
-                pending_txns = list(self.connection.mapper.values())
-                self.connection.mapper.clear()
+                pending_txns = list(conn.mapper.values())
+                conn.mapper.clear()
                 for tx in pending_txns:
                     if not tx.done():
                         tx.cancel()
@@ -965,8 +974,8 @@ class Browser:
 
             # 2. Cancel the listener task.
             try:
-                listener = self.connection._listener_task
-                self.connection._listener_task = None
+                listener = conn._listener_task
+                conn._listener_task = None
                 if listener and not listener.done():
                     listener.cancel()
             except Exception:
@@ -976,13 +985,13 @@ class Browser:
             #    causes the websockets library's internal keepalive task to
             #    fail and exit, rather than leaving it pending.
             try:
-                ws = self.connection.websocket
+                ws = conn.websocket
                 if ws:
                     transport = getattr(ws, 'transport', None)
                     if transport:
                         transport.close()
-                    self.connection._websocket = None
-                self.connection.enabled_domains.clear()
+                    conn._websocket = None
+                conn.enabled_domains.clear()
             except Exception:
                 pass
 
