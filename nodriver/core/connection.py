@@ -349,6 +349,18 @@ class Connection(metaclass=CantTouchThis):
         if listener and listener is not asyncio.current_task() and not listener.done():
             listener.cancel()
             await asyncio.gather(listener, return_exceptions=True)
+
+        # Cancel all pending Transaction futures so tasks awaiting CDP
+        # responses (e.g. update_targets) can exit instead of hanging.
+        try:
+            pending_txns = list(self.mapper.values())
+            self.mapper.clear()
+            for tx in pending_txns:
+                if not tx.done():
+                    tx.cancel()
+        except Exception:
+            pass
+
         if self.websocket:
             self.enabled_domains.clear()
             try:

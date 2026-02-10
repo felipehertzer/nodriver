@@ -947,25 +947,44 @@ class Browser:
         except Exception:
             pass
 
-        # Best-effort websocket disconnect.
-        # Do not attempt CDP Browser.close here: it can hang forever if Chrome is already wedged.
+        # Clean up the websocket connection synchronously.
+        # We avoid fire-and-forget async tasks here because the event loop
+        # may be closed immediately after stop() returns, leaving those tasks
+        # as "destroyed but pending".
         if self.connection:
+            # 1. Cancel all pending Transaction futures so tasks awaiting CDP
+            #    responses (e.g. update_targets) can exit immediately.
             try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
+                pending_txns = list(self.connection.mapper.values())
+                self.connection.mapper.clear()
+                for tx in pending_txns:
+                    if not tx.done():
+                        tx.cancel()
+            except Exception:
+                pass
 
-            if loop and loop.is_running():
-                try:
-                    loop.create_task(self.connection.disconnect())
-                except Exception:
-                    pass
-            else:
-                try:
-                    asyncio.run(asyncio.wait_for(self.connection.disconnect(), timeout=2))
-                except BaseException:
-                    # CancelledError is a BaseException on modern Python versions.
-                    pass
+            # 2. Cancel the listener task.
+            try:
+                listener = self.connection._listener_task
+                self.connection._listener_task = None
+                if listener and not listener.done():
+                    listener.cancel()
+            except Exception:
+                pass
+
+            # 3. Force-close the websocket transport. This is synchronous and
+            #    causes the websockets library's internal keepalive task to
+            #    fail and exit, rather than leaving it pending.
+            try:
+                ws = self.connection.websocket
+                if ws:
+                    transport = getattr(ws, 'transport', None)
+                    if transport:
+                        transport.close()
+                    self.connection._websocket = None
+                self.connection.enabled_domains.clear()
+            except Exception:
+                pass
 
         # Kill the browser process (and its children).
         pid = self._process_pid or (self._process.pid if self._process else None)
