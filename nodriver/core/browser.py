@@ -170,6 +170,7 @@ class Browser:
         self._keep_user_data_dir = None
         self._proxy_forwarders = []
         self._is_updating = asyncio.Event()
+        self._update_tasks: set = set()
         self.connection: Connection = None
         logger.debug("Session object initialized: %s" % vars(self))
 
@@ -291,7 +292,9 @@ class Browser:
             )
             self.targets.remove(current_tab)
 
-        asyncio.create_task(self.update_targets())
+        task = asyncio.create_task(self.update_targets())
+        self._update_tasks.add(task)
+        task.add_done_callback(self._update_tasks.discard)
 
     async def get(
         self, url="chrome://welcome", new_tab: bool = False, new_window: bool = False
@@ -930,6 +933,15 @@ class Browser:
         without relying on pending tasks that might never run (e.g. when the loop
         stops right after).
         """
+        # Cancel any fire-and-forget update_targets tasks.
+        for task in list(getattr(self, '_update_tasks', set())):
+            if not task.done():
+                task.cancel()
+        try:
+            self._update_tasks.clear()
+        except Exception:
+            pass
+
         # Close any local proxy forwarders (used for authenticated proxy URLs).
         try:
             fws = getattr(self, "_proxy_forwarders", None) or []
@@ -1193,6 +1205,14 @@ class Browser:
                             pass
             except BaseException:
                 pass
+
+            # Disconnect all tab connections (each has its own websocket/listener/keepalive).
+            for t in list(getattr(self, 'targets', []) or []):
+                if t is not self.connection and hasattr(t, 'disconnect'):
+                    try:
+                        await asyncio.wait_for(t.disconnect(), timeout=2.0)
+                    except BaseException:
+                        pass
 
             if self.connection:
                 try:
